@@ -1,0 +1,29 @@
+# Mind Chess Data Service Configuration
+# Copy to /etc/chess-data-service/config.toml
+
+[server]
+# Bind address (0.0.0.0 for all interfaces)
+bind = "0.0.0.0:8787"
+
+# Worker threads (0 = auto-detect CPU count)
+threads = 0
+
+[data]
+# Root directory for chess data
+root = "/var/lib/chess-data"
+
+[book]
+# Enable opening book queries
+enabled = true
+
+# Maximum moves to return per query
+max_moves = 20
+
+[tb8]
+# Enable 8-man tablebase queries
+# Set to false if TB8 files not available
+enabled = false
+
+[nnue]
+# Enable NNUE training data queries
+enabled = true

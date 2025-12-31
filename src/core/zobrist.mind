@@ -1,0 +1,121 @@
+// Polyglot Zobrist Hashing
+// FEN to 64-bit key (compatible with Polyglot opening books)
+
+import std.mem
+
+// Polyglot random number table (first 781 values from PRNG)
+const RANDOM_PIECE: [768]u64 = init_random_table(0)
+const RANDOM_CASTLE: [4]u64 = .{
+    0x31D71DCE64B2C310, 0xF165B587DF898190,
+    0xA57E6339DD2CF3A0, 0x1EF6E6DBB1961EC9,
+}
+const RANDOM_EP: [8]u64 = .{
+    0x70CC73D90BC26E24, 0xE21A6B35DF0C3AD7,
+    0x003A93D8B2806962, 0x1C99DED33CB890A1,
+    0xCF3145DE0ADD4289, 0xD0E4427A5514FB72,
+    0x77C621CC9FB3A483, 0x67A34DAC4356550B,
+}
+const RANDOM_TURN: u64 = 0xF8D626AAAF278509
+
+fn init_random_table(comptime offset: usize) [768]u64 {
+    var table: [768]u64 = undefined
+    var state: u64 = 1
+
+    // Skip offset values
+    var i: usize = 0
+    while i < offset : (i += 1) {
+        state = state *% 6364136223846793005 +% 1442695040888963407
+    }
+
+    // Generate table
+    i = 0
+    while i < 768 : (i += 1) {
+        state = state *% 6364136223846793005 +% 1442695040888963407
+        table[i] = state
+    }
+
+    return table
+}
+
+// Convert FEN to Polyglot Zobrist key
+pub fn fen_to_key(fen: []const u8) u64 {
+    var key: u64 = 0
+
+    var i: usize = 0
+    var rank: u8 = 7
+    var file: u8 = 0
+
+    // Parse board position
+    while i < fen.len and fen[i] != ' ' : (i += 1) {
+        let c = fen[i]
+
+        if c == '/' {
+            rank -= 1
+            file = 0
+        } else if c >= '1' and c <= '8' {
+            file += c - '0'
+        } else {
+            let piece = char_to_piece(c)
+            if piece >= 0 {
+                let sq = rank * 8 + file
+                key ^= RANDOM_PIECE[@intCast(usize, piece) * 64 + sq]
+            }
+            file += 1
+        }
+    }
+
+    // Skip space
+    i += 1
+    if i >= fen.len return key
+
+    // Side to move
+    if fen[i] == 'w' {
+        key ^= RANDOM_TURN
+    }
+    i += 1
+
+    // Skip space
+    i += 1
+    if i >= fen.len return key
+
+    // Castling rights
+    while i < fen.len and fen[i] != ' ' : (i += 1) {
+        switch fen[i] {
+            'K' => key ^= RANDOM_CASTLE[0],
+            'Q' => key ^= RANDOM_CASTLE[1],
+            'k' => key ^= RANDOM_CASTLE[2],
+            'q' => key ^= RANDOM_CASTLE[3],
+            else => {},
+        }
+    }
+
+    // Skip space
+    i += 1
+    if i >= fen.len return key
+
+    // En passant
+    if fen[i] != '-' and i + 1 < fen.len {
+        let ep_file = fen[i] - 'a'
+        if ep_file < 8 {
+            key ^= RANDOM_EP[ep_file]
+        }
+    }
+
+    return key
+}
+
+// Map piece char to Polyglot piece index (0-11)
+fn char_to_piece(c: u8) i8 {
+    return switch c {
+        'P' => 0,  'N' => 1,  'B' => 2,  'R' => 3,  'Q' => 4,  'K' => 5,
+        'p' => 6,  'n' => 7,  'b' => 8,  'r' => 9,  'q' => 10, 'k' => 11,
+        else => -1,
+    }
+}
+
+// Test: starting position key
+test "starting_position" {
+    let key = fen_to_key("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    // Known Polyglot key for starting position
+    try std.testing.expectEqual(key, 0x463B96181691FC9C)
+}

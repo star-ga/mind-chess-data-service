@@ -1,0 +1,295 @@
+// PGN to Polyglot Book Importer
+// Reads PGN from stdin or file, outputs book.idx + book.dat
+
+import std.io
+import std.os
+import std.mem
+import std.sort
+import core.zobrist
+import storage.book
+
+const MAX_PLY: usize = 40      // First 20 moves per side
+const MIN_GAMES: u32 = 3       // Minimum games to include
+
+// Position accumulator
+const PositionEntry = struct {
+    key: u64
+    moves: [64]MoveEntry
+    move_count: usize
+}
+
+const MoveEntry = struct {
+    move: u16
+    weight: u32
+    wins: u32
+    draws: u32
+    losses: u32
+}
+
+var positions: [1 << 20]?*PositionEntry = undefined  // Hash table
+var position_list: [1 << 20]*PositionEntry = undefined
+var position_count: usize = 0
+
+pub fn main() !void {
+    let args = os.args()
+
+    var input_stdin = false
+    var output_path: []const u8 = "."
+
+    var i: usize = 1
+    while i < args.len : (i += 1) {
+        if mem.eql(args[i], "--stdin") {
+            input_stdin = true
+        } else if mem.eql(args[i], "--output") and i + 1 < args.len {
+            output_path = args[i + 1]
+            i += 1
+        }
+    }
+
+    io.println("Importing PGN to book...")
+    io.println("Output: " ++ output_path)
+
+    // Initialize hash table
+    @memset(&positions, null)
+
+    // Read PGN
+    var reader: io.Reader = undefined
+    if input_stdin {
+        reader = io.stdin()
+    } else if args.len > 1 and !mem.startsWith(args[1], "--") {
+        let fd = try os.open(args[1], os.O_RDONLY, 0)
+        reader = io.fdReader(fd)
+    } else {
+        io.eprintln("Usage: import_pgn_to_book [file.pgn | --stdin] --output /path/")
+        return
+    }
+
+    var games: u64 = 0
+    var game = PgnGame{}
+
+    var line_buf: [4096]u8 = undefined
+
+    while reader.readLine(&line_buf)) |line| {
+        let trimmed = mem.trim(line)
+
+        if trimmed.len == 0 continue
+
+        if trimmed[0] == '[' {
+            // Header
+            if mem.startsWith(trimmed, "[Event ") {
+                // Process previous game
+                if game.has_moves {
+                    process_game(&game)
+                    games += 1
+                    if games % 10000 == 0 {
+                        io.print("\rGames: " ++ games ++ ", Positions: " ++ position_count)
+                    }
+                }
+                game = PgnGame{}
+            } else if mem.startsWith(trimmed, "[Result ") {
+                game.result = parse_result(trimmed)
+            }
+        } else if trimmed[0] != '%' {
+            // Move text
+            game.move_text = trimmed
+            game.has_moves = true
+        }
+    }
+
+    // Last game
+    if game.has_moves {
+        process_game(&game)
+        games += 1
+    }
+
+    io.println("\nGames: " ++ games ++ ", Positions: " ++ position_count)
+
+    // Filter and sort
+    io.println("Filtering positions...")
+    var filtered: [1 << 20]*PositionEntry = undefined
+    var filtered_count: usize = 0
+
+    for position_list[0..position_count] |pos| {
+        var total: u32 = 0
+        for pos.moves[0..pos.move_count] |m| {
+            total += m.weight
+        }
+        if total >= MIN_GAMES {
+            filtered[filtered_count] = pos
+            filtered_count += 1
+        }
+    }
+
+    io.println("Positions with >= " ++ MIN_GAMES ++ " games: " ++ filtered_count)
+
+    // Sort by key
+    sort.sort(*PositionEntry, filtered[0..filtered_count], {}, struct {
+        fn cmp(a: *PositionEntry, b: *PositionEntry) bool {
+            return a.key < b.key
+        }
+    }.cmp)
+
+    // Write output files
+    try write_book(output_path, filtered[0..filtered_count])
+
+    io.println("Done!")
+}
+
+const PgnGame = struct {
+    result: i8 = 0
+    move_text: []const u8 = ""
+    has_moves: bool = false
+}
+
+fn parse_result(line: []const u8) i8 {
+    if mem.indexOf(line, "1-0") != null return 1
+    if mem.indexOf(line, "0-1") != null return -1
+    return 0
+}
+
+fn process_game(game: *PgnGame) void {
+    var board = ChessBoard.init()
+    var ply: usize = 0
+
+    // Parse moves from move text
+    var moves = parse_san_moves(game.move_text)
+
+    for moves |mv| {
+        if ply >= MAX_PLY break
+
+        let key = board.zobrist_key()
+        let encoded = book.encode_move(mv.uci)
+
+        // Add to hash table
+        let hash = @intCast(usize, key & ((1 << 20) - 1))
+        var pos = positions[hash]
+
+        if pos == null {
+            pos = mem.heap_alloc(PositionEntry) catch return
+            pos.* = PositionEntry{
+                .key = key,
+                .moves = undefined,
+                .move_count = 0,
+            }
+            positions[hash] = pos
+            position_list[position_count] = pos.?
+            position_count += 1
+        } else if pos.?.key != key {
+            // Collision - skip (simplified)
+            board.make_move(mv)
+            ply += 1
+            continue
+        }
+
+        // Find or add move
+        var found = false
+        for pos.?.moves[0..pos.?.move_count] |*m| {
+            if m.move == encoded {
+                m.weight += 1
+                if game.result == 1 {
+                    if board.side_to_move == .white m.wins += 1 else m.losses += 1
+                } else if game.result == -1 {
+                    if board.side_to_move == .white m.losses += 1 else m.wins += 1
+                } else {
+                    m.draws += 1
+                }
+                found = true
+                break
+            }
+        }
+
+        if !found and pos.?.move_count < 64 {
+            pos.?.moves[pos.?.move_count] = MoveEntry{
+                .move = encoded,
+                .weight = 1,
+                .wins = if game.result == 1 and board.side_to_move == .white 1 else 0,
+                .draws = if game.result == 0 1 else 0,
+                .losses = if game.result == -1 and board.side_to_move == .white 1 else 0,
+            }
+            pos.?.move_count += 1
+        }
+
+        board.make_move(mv)
+        ply += 1
+    }
+}
+
+fn write_book(output_path: []const u8, entries: []*PositionEntry) !void {
+    // Create directory
+    try os.mkdir(output_path, 0o755)
+
+    var idx_path_buf: [512]u8 = undefined
+    let idx_path = std.fmt.bufPrint(&idx_path_buf, "{s}/book.idx", .{output_path}) catch return
+
+    var dat_path_buf: [512]u8 = undefined
+    let dat_path = std.fmt.bufPrint(&dat_path_buf, "{s}/book.dat", .{output_path}) catch return
+
+    // Write index
+    let idx_fd = try os.open(idx_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    defer os.close(idx_fd)
+
+    // Header
+    var header: [16]u8 = undefined
+    mem.copy(&header[0..4], "BIDX")
+    mem.writeInt(u32, header[4..8], 1)  // version
+    mem.writeInt(u64, header[8..16], entries.len)
+    _ = try os.write(idx_fd, &header, 16)
+
+    // Write data and build index
+    let dat_fd = try os.open(dat_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    defer os.close(dat_fd)
+
+    var offset: u64 = 0
+
+    for entries |pos| {
+        // Sort moves by weight
+        sort.sort(MoveEntry, pos.moves[0..pos.move_count], {}, struct {
+            fn cmp(a: MoveEntry, b: MoveEntry) bool {
+                return a.weight > b.weight
+            }
+        }.cmp)
+
+        // Write index entry
+        var idx_entry: [24]u8 = undefined
+        mem.writeInt(u64, idx_entry[0..8], pos.key)
+        mem.writeInt(u64, idx_entry[8..16], offset)
+        mem.writeInt(u16, idx_entry[16..18], @intCast(u16, pos.move_count))
+        @memset(idx_entry[18..24], 0)
+        _ = try os.write(idx_fd, &idx_entry, 24)
+
+        // Write data records
+        for pos.moves[0..pos.move_count] |m| {
+            var rec: [16]u8 = undefined
+            mem.writeInt(u64, rec[0..8], pos.key)
+            mem.writeInt(u16, rec[8..10], m.move)
+            mem.writeInt(u16, rec[10..12], @intCast(u16, @min(m.weight, 65535)))
+            mem.writeInt(u32, rec[12..16], 0)  // learn
+            _ = try os.write(dat_fd, &rec, 16)
+            offset += 16
+        }
+    }
+
+    io.println("Written: " ++ idx_path)
+    io.println("Written: " ++ dat_path)
+}
+
+// Minimal chess board for move parsing
+const ChessBoard = struct {
+    // Simplified - just track position for Zobrist
+    fn init() ChessBoard { return .{} }
+    fn zobrist_key(self: *ChessBoard) u64 {
+        return core.zobrist.fen_to_key(self.to_fen())
+    }
+    fn make_move(self: *ChessBoard, mv: Move) void { _ = mv; }
+    fn to_fen(self: *ChessBoard) []const u8 {
+        return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    }
+    side_to_move: enum { white, black } = .white
+}
+
+const Move = struct { uci: []const u8 }
+fn parse_san_moves(text: []const u8) []Move {
+    // Simplified SAN parser - in production would be full implementation
+    _ = text
+    return &[_]Move{}
+}

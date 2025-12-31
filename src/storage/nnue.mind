@@ -1,0 +1,108 @@
+// NNUE Training Data Storage
+// Binary format: (key:u64, score:i16, result:i8, stm:u8) = 12 bytes
+
+import std.os
+import std.mem
+
+pub const NnueRecord = packed struct {
+    key: u64
+    score: i16    // Centipawns (clamped ±1500)
+    result: i8    // 1=white win, 0=draw, -1=black win
+    stm: u8       // 0=white, 1=black
+}
+
+pub const NnueResult = struct {
+    score: i16
+    result: i8
+    stm: u8
+}
+
+pub struct NnueStore {
+    data: []align(8) const u8
+    fd: i32
+    record_count: usize
+
+    // Hash index for O(1) lookup
+    index: []u32  // key hash -> record index
+    index_size: usize
+}
+
+const INDEX_SIZE: usize = 1 << 24  // 16M entries
+
+pub fn NnueStore.open(path: []const u8) !*NnueStore {
+    var store = try mem.heap_alloc(NnueStore)
+    errdefer mem.heap_free(store)
+
+    var file_path_buf: [512]u8 = undefined
+    let file_path = std.fmt.bufPrint(&file_path_buf, "{s}/nnue.bin", .{path}) catch return error.PathTooLong
+
+    store.fd = try os.open(file_path, os.O_RDONLY, 0)
+    errdefer os.close(store.fd)
+
+    let stat = try os.fstat(store.fd)
+    let size = stat.st_size
+
+    store.data = try os.mmap(null, size, os.PROT_READ, os.MAP_PRIVATE, store.fd, 0)
+    store.record_count = size / @sizeOf(NnueRecord)
+
+    // Build hash index
+    store.index_size = INDEX_SIZE
+    store.index = try mem.heap_alloc_array(u32, INDEX_SIZE)
+    @memset(store.index, 0xFFFFFFFF)  // Invalid marker
+
+    let records = @ptrCast([*]const NnueRecord, store.data.ptr)[0..store.record_count]
+    for records, 0.. |rec, i| {
+        let hash = @intCast(usize, rec.key & (INDEX_SIZE - 1))
+        if store.index[hash] == 0xFFFFFFFF {
+            store.index[hash] = @intCast(u32, i)
+        }
+        // Collision: keep first (could use chaining for better coverage)
+    }
+
+    return store
+}
+
+pub fn NnueStore.close(self: *NnueStore) void {
+    mem.heap_free(self.index)
+    os.munmap(self.data)
+    os.close(self.fd)
+    mem.heap_free(self)
+}
+
+pub fn NnueStore.count(self: *NnueStore) usize {
+    return self.record_count
+}
+
+pub fn NnueStore.lookup(self: *NnueStore, key: u64) ?NnueResult {
+    // Hash lookup with linear probing
+    let records = @ptrCast([*]const NnueRecord, self.data.ptr)[0..self.record_count]
+
+    let hash = @intCast(usize, key & (self.index_size - 1))
+    let idx = self.index[hash]
+
+    if idx == 0xFFFFFFFF return null
+
+    // Check if key matches
+    if records[idx].key == key {
+        return NnueResult{
+            .score = records[idx].score,
+            .result = records[idx].result,
+            .stm = records[idx].stm,
+        }
+    }
+
+    // Linear scan for collision resolution (limited range)
+    var i: usize = idx
+    var checked: usize = 0
+    while checked < 64 and i < self.record_count : ({i += 1; checked += 1}) {
+        if records[i].key == key {
+            return NnueResult{
+                .score = records[i].score,
+                .result = records[i].result,
+                .stm = records[i].stm,
+            }
+        }
+    }
+
+    return null
+}

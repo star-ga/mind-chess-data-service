@@ -1,0 +1,271 @@
+// Mind Chess Data Service - Main Entry
+// Pure Mind implementation with mmap storage
+
+import std.io
+import std.os
+import std.sync
+import std.time
+
+import server.http
+import storage.book
+import storage.tb8
+import storage.nnue
+import core.config
+
+// Global state
+var g_state: *State = null
+
+struct State {
+    config: config.Config
+    book: ?*book.BookStore
+    tb8: ?*tb8.Tb8Store
+    nnue: ?*nnue.NnueStore
+    lock: sync.RwLock
+    start_time: u64
+}
+
+pub fn main() -> i32 {
+    let args = os.args()
+
+    if args.len < 2 {
+        io.eprintln("Usage: mind-chess-data-service serve [--config path]")
+        return 1
+    }
+
+    if args[1] != "serve" {
+        io.eprintln("Unknown command: " ++ args[1])
+        return 1
+    }
+
+    // Parse config path
+    var config_path = "/etc/chess-data-service/config.toml"
+    var i: usize = 2
+    while i < args.len : (i += 1) {
+        if args[i] == "--config" and i + 1 < args.len {
+            config_path = args[i + 1]
+            i += 1
+        }
+    }
+
+    // Load config
+    let cfg = config.load(config_path) catch |e| {
+        io.eprintln("Config error: " ++ e.
+        return 1
+    }
+
+    // Init state
+    g_state = sync.heap_alloc(State) catch {
+        io.eprintln("Out of memory")
+        return 1
+    }
+
+    g_state.* = State{
+        .config = cfg,
+        .book = null,
+        .tb8 = null,
+        .nnue = null,
+        .lock = sync.RwLock.init(),
+        .start_time = time.timestamp(),
+    }
+
+    // Load data stores
+    reload_stores()
+
+    // Setup SIGHUP handler
+    os.signal(os.SIGHUP, handle_sighup)
+
+    // Start server
+    io.println("Starting server on " ++ cfg.server.bind)
+
+    var srv = http.Server.init(cfg.server.bind, cfg.server.threads)
+
+    srv.route("GET", "/health", handle_health)
+    srv.route("POST", "/book/query", handle_book_query)
+    srv.route("POST", "/tb8/query", handle_tb8_query)
+    srv.route("POST", "/nnue/query", handle_nnue_query)
+    srv.route("POST", "/admin/reload", handle_reload)
+
+    srv.run() catch |e| {
+        io.eprintln("Server error: " ++ e)
+        return 1
+    }
+
+    return 0
+}
+
+fn handle_sighup() void {
+    io.println("SIGHUP received, reloading...")
+    reload_stores()
+}
+
+fn reload_stores() void {
+    let s = g_state
+    s.lock.write_lock()
+    defer s.lock.write_unlock()
+
+    let root = s.config.data.root
+
+    // Book
+    if s.config.book.enabled {
+        let path = root ++ "/book/current"
+        if os.exists(path) {
+            s.book = book.BookStore.open(path) catch |e| {
+                io.eprintln("Book warning: " ++ e)
+                null
+            }
+            if s.book != null {
+                io.println("Book loaded: " ++ s.book.?.count() ++ " positions")
+            }
+        }
+    }
+
+    // TB8
+    if s.config.tb8.enabled {
+        let path = root ++ "/tb8/current"
+        if os.exists(path) {
+            s.tb8 = tb8.Tb8Store.open(path) catch |e| {
+                io.eprintln("TB8 warning: " ++ e)
+                null
+            }
+            if s.tb8 != null {
+                io.println("TB8 loaded: " ++ s.tb8.?.count() ++ " positions")
+            }
+        }
+    }
+
+    // NNUE
+    if s.config.nnue.enabled {
+        let path = root ++ "/nnue/current"
+        if os.exists(path) {
+            s.nnue = nnue.NnueStore.open(path) catch |e| {
+                io.eprintln("NNUE warning: " ++ e)
+                null
+            }
+            if s.nnue != null {
+                io.println("NNUE loaded: " ++ s.nnue.?.count() ++ " positions")
+            }
+        }
+    }
+}
+
+// GET /health
+fn handle_health(req: *http.Request, res: *http.Response) void {
+    let s = g_state
+    s.lock.read_lock()
+    defer s.lock.read_unlock()
+
+    let uptime = time.timestamp() - s.start_time
+
+    res.json(.{
+        .ok = true,
+        .book = s.book != null,
+        .tb8 = s.tb8 != null,
+        .nnue = s.nnue != null,
+        .uptime = uptime,
+    })
+}
+
+// POST /book/query
+fn handle_book_query(req: *http.Request, res: *http.Response) void {
+    let s = g_state
+    s.lock.read_lock()
+    defer s.lock.read_unlock()
+
+    let body = req.json() catch {
+        res.status(400).json(.{ .error = "invalid json" })
+        return
+    }
+
+    let fen = body.get_string("fen") catch {
+        res.status(400).json(.{ .error = "missing fen" })
+        return
+    }
+
+    let max_moves = body.get_int("max_moves") catch s.config.book.max_moves
+
+    if s.book == null {
+        res.json(.{ .key = 0, .moves = .{} })
+        return
+    }
+
+    let key = core.zobrist.fen_to_key(fen)
+    let moves = s.book.?.lookup(key, @intCast(max_moves))
+
+    res.json(.{ .key = key, .moves = moves })
+}
+
+// POST /tb8/query
+fn handle_tb8_query(req: *http.Request, res: *http.Response) void {
+    let s = g_state
+    s.lock.read_lock()
+    defer s.lock.read_unlock()
+
+    let body = req.json() catch {
+        res.status(400).json(.{ .error = "invalid json" })
+        return
+    }
+
+    let fen = body.get_string("fen") catch {
+        res.status(400).json(.{ .error = "missing fen" })
+        return
+    }
+
+    if s.tb8 == null {
+        res.json(.{ .wdl = null, .dtz = null, .source = "disabled" })
+        return
+    }
+
+    let key = core.zobrist.fen_to_key(fen)
+    let result = s.tb8.?.lookup(key)
+
+    if result != null {
+        res.json(.{
+            .wdl = result.?.wdl,
+            .dtz = result.?.dtz,
+            .source = "local",
+        })
+    } else {
+        res.json(.{ .wdl = null, .dtz = null, .source = "not_found" })
+    }
+}
+
+// POST /nnue/query
+fn handle_nnue_query(req: *http.Request, res: *http.Response) void {
+    let s = g_state
+    s.lock.read_lock()
+    defer s.lock.read_unlock()
+
+    let body = req.json() catch {
+        res.status(400).json(.{ .error = "invalid json" })
+        return
+    }
+
+    let fen = body.get_string("fen") catch {
+        res.status(400).json(.{ .error = "missing fen" })
+        return
+    }
+
+    if s.nnue == null {
+        res.json(.{ .key = 0, .score = null })
+        return
+    }
+
+    let key = core.zobrist.fen_to_key(fen)
+    let result = s.nnue.?.lookup(key)
+
+    if result != null {
+        res.json(.{
+            .key = key,
+            .score = result.?.score,
+            .stm = if result.?.stm == 0 "w" else "b",
+        })
+    } else {
+        res.json(.{ .key = key, .score = null })
+    }
+}
+
+// POST /admin/reload
+fn handle_reload(req: *http.Request, res: *http.Response) void {
+    reload_stores()
+    res.json(.{ .status = "ok" })
+}

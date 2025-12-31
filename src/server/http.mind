@@ -1,0 +1,298 @@
+// HTTP Server - Pure Mind implementation
+// Minimal HTTP/1.1 server with JSON support
+
+import std.io
+import std.os
+import std.net
+import std.sync
+import std.mem
+
+pub const MAX_REQUEST_SIZE: usize = 65536
+pub const MAX_HEADERS: usize = 64
+
+pub struct Request {
+    method: []const u8
+    path: []const u8
+    body: []const u8
+    headers: [MAX_HEADERS]Header
+    header_count: usize
+}
+
+pub struct Header {
+    name: []const u8
+    value: []const u8
+}
+
+pub struct Response {
+    socket: net.Socket
+    status_code: u16
+    sent: bool
+}
+
+pub struct Route {
+    method: []const u8
+    path: []const u8
+    handler: fn(*Request, *Response) void
+}
+
+pub struct Server {
+    bind_addr: []const u8
+    threads: u32
+    routes: [64]Route
+    route_count: usize
+    socket: net.Socket
+}
+
+pub fn Server.init(bind: []const u8, threads: u32) Server {
+    return Server{
+        .bind_addr = bind,
+        .threads = threads,
+        .routes = undefined,
+        .route_count = 0,
+        .socket = undefined,
+    }
+}
+
+pub fn Server.route(self: *Server, method: []const u8, path: []const u8, handler: fn(*Request, *Response) void) void {
+    if self.route_count < 64 {
+        self.routes[self.route_count] = Route{
+            .method = method,
+            .path = path,
+            .handler = handler,
+        }
+        self.route_count += 1
+    }
+}
+
+pub fn Server.run(self: *Server) !void {
+    // Parse bind address
+    let parts = split_addr(self.bind_addr)
+    let host = parts.host
+    let port = parts.port
+
+    // Create socket
+    self.socket = try net.socket(net.AF_INET, net.SOCK_STREAM, 0)
+    errdefer net.close(self.socket)
+
+    // Set SO_REUSEADDR
+    var opt: i32 = 1
+    _ = net.setsockopt(self.socket, net.SOL_SOCKET, net.SO_REUSEADDR, &opt, @sizeOf(i32))
+
+    // Bind
+    var addr = net.sockaddr_in{
+        .sin_family = net.AF_INET,
+        .sin_port = net.htons(port),
+        .sin_addr = net.inet_addr(host),
+    }
+    try net.bind(self.socket, @ptrCast(&addr), @sizeOf(net.sockaddr_in))
+
+    // Listen
+    try net.listen(self.socket, 128)
+
+    // Accept loop
+    while true {
+        let client = net.accept(self.socket, null, null) catch continue
+
+        // Handle in thread pool (simplified: inline for now)
+        self.handle_connection(client)
+    }
+}
+
+fn Server.handle_connection(self: *Server, client: net.Socket) void {
+    defer net.close(client)
+
+    // Read request
+    var buf: [MAX_REQUEST_SIZE]u8 = undefined
+    let n = net.recv(client, &buf, MAX_REQUEST_SIZE, 0) catch return
+    if n <= 0 return
+
+    // Parse request
+    var req = parse_request(buf[0..n]) catch return
+
+    // Create response
+    var res = Response{
+        .socket = client,
+        .status_code = 200,
+        .sent = false,
+    }
+
+    // Find route
+    var found = false
+    for self.routes[0..self.route_count] |route| {
+        if mem.eql(route.method, req.method) and mem.eql(route.path, req.path) {
+            route.handler(&req, &res)
+            found = true
+            break
+        }
+    }
+
+    if !found {
+        res.status(404).json(.{ .error = "not found" })
+    }
+}
+
+fn parse_request(data: []const u8) !Request {
+    var req = Request{
+        .method = "",
+        .path = "",
+        .body = "",
+        .headers = undefined,
+        .header_count = 0,
+    }
+
+    // Find first line
+    var i: usize = 0
+
+    // Method
+    let method_end = mem.indexOf(data, ' ') orelse return error.InvalidRequest
+    req.method = data[0..method_end]
+    i = method_end + 1
+
+    // Path
+    let path_end = mem.indexOf(data[i..], ' ') orelse return error.InvalidRequest
+    req.path = data[i..i+path_end]
+    i += path_end + 1
+
+    // Skip to headers (after first \r\n)
+    let header_start = mem.indexOf(data[i..], "\r\n") orelse return error.InvalidRequest
+    i += header_start + 2
+
+    // Parse headers
+    while i < data.len and req.header_count < MAX_HEADERS {
+        if data[i] == '\r' and i + 1 < data.len and data[i + 1] == '\n' {
+            i += 2
+            break  // End of headers
+        }
+
+        let line_end = mem.indexOf(data[i..], "\r\n") orelse break
+        let line = data[i..i+line_end]
+
+        let colon = mem.indexOf(line, ':') orelse {
+            i += line_end + 2
+            continue
+        }
+
+        req.headers[req.header_count] = Header{
+            .name = line[0..colon],
+            .value = mem.trim(line[colon+1..]),
+        }
+        req.header_count += 1
+        i += line_end + 2
+    }
+
+    // Body is rest
+    if i < data.len {
+        req.body = data[i..]
+    }
+
+    return req
+}
+
+pub fn Request.json(self: *Request) !JsonValue {
+    return json.parse(self.body)
+}
+
+pub fn Response.status(self: *Response, code: u16) *Response {
+    self.status_code = code
+    return self
+}
+
+pub fn Response.json(self: *Response, value: anytype) void {
+    if self.sent return
+    self.sent = true
+
+    let body = json.stringify(value)
+    let status_text = get_status_text(self.status_code)
+
+    var header_buf: [512]u8 = undefined
+    let header = std.fmt.bufPrint(&header_buf,
+        "HTTP/1.1 {d} {s}\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "Connection: close\r\n\r\n",
+        .{ self.status_code, status_text, body.len }
+    ) catch return
+
+    _ = net.send(self.socket, header, header.len, 0) catch return
+    _ = net.send(self.socket, body, body.len, 0) catch return
+}
+
+fn get_status_text(code: u16) []const u8 {
+    return switch code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        else => "Unknown",
+    }
+}
+
+fn split_addr(addr: []const u8) struct { host: []const u8, port: u16 } {
+    let colon = mem.indexOf(addr, ':') orelse return .{ .host = addr, .port = 8787 }
+    let port = std.fmt.parseInt(u16, addr[colon+1..], 10) catch 8787
+    return .{ .host = addr[0..colon], .port = port }
+}
+
+// Minimal JSON support
+pub const json = struct {
+    pub const JsonValue = union(enum) {
+        null_,
+        bool_: bool,
+        int_: i64,
+        string_: []const u8,
+        array_: []JsonValue,
+        object_: []struct { key: []const u8, value: JsonValue },
+    }
+
+    pub fn parse(data: []const u8) !JsonValue {
+        // Simplified JSON parser
+        var i: usize = 0
+        return parse_value(data, &i)
+    }
+
+    fn parse_value(data: []const u8, i: *usize) !JsonValue {
+        skip_whitespace(data, i)
+        if i.* >= data.len return error.UnexpectedEof
+
+        return switch data[i.*] {
+            '{' => parse_object(data, i),
+            '[' => parse_array(data, i),
+            '"' => JsonValue{ .string_ = try parse_string(data, i) },
+            't', 'f' => parse_bool(data, i),
+            'n' => parse_null(data, i),
+            '0'...'9', '-' => parse_number(data, i),
+            else => error.InvalidJson,
+        }
+    }
+
+    pub fn stringify(value: anytype) []const u8 {
+        // Use comptime reflection to stringify
+        var buf: [4096]u8 = undefined
+        var stream = std.io.fixedBufferStream(&buf)
+        stringify_value(stream.writer(), value) catch return "{}"
+        return stream.getWritten()
+    }
+
+    pub fn JsonValue.get_string(self: JsonValue, key: []const u8) ![]const u8 {
+        if self != .object_ return error.NotObject
+        for self.object_ |kv| {
+            if mem.eql(kv.key, key) {
+                if kv.value == .string_ return kv.value.string_
+                return error.NotString
+            }
+        }
+        return error.KeyNotFound
+    }
+
+    pub fn JsonValue.get_int(self: JsonValue, key: []const u8) !i64 {
+        if self != .object_ return error.NotObject
+        for self.object_ |kv| {
+            if mem.eql(kv.key, key) {
+                if kv.value == .int_ return kv.value.int_
+                return error.NotInt
+            }
+        }
+        return error.KeyNotFound
+    }
+}

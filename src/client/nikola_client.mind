@@ -1,0 +1,294 @@
+// Nikola Engine HTTP Client - Fail-Open Pattern
+// Queries mind-chess-data-service for book/tb8/nnue data
+// Returns empty results on timeout/error (fail-open)
+
+import std.net
+import std.mem
+import std.io
+
+const DEFAULT_TIMEOUT_MS: u32 = 100  // 100ms timeout
+const MAX_RESPONSE: usize = 8192
+
+pub const BookClient = struct {
+    host: []const u8
+    port: u16
+    timeout_ms: u32
+    enabled: bool
+
+    pub fn init(url: []const u8) BookClient {
+        var client = BookClient{
+            .host = "127.0.0.1",
+            .port = 8787,
+            .timeout_ms = DEFAULT_TIMEOUT_MS,
+            .enabled = false,
+        }
+
+        // Parse URL: http://host:port
+        if url.len == 0 return client
+
+        var host_start: usize = 0
+        if mem.startsWith(url, "http://") {
+            host_start = 7
+        } else if mem.startsWith(url, "https://") {
+            host_start = 8
+        }
+
+        let rest = url[host_start..]
+        let colon = mem.indexOf(rest, ':')
+
+        if colon != null {
+            client.host = rest[0..colon.?]
+            let port_str = rest[colon.? + 1..]
+            let slash = mem.indexOf(port_str, '/')
+            let port_end = if slash != null slash.? else port_str.len
+            client.port = parse_u16(port_str[0..port_end]) catch 8787
+        } else {
+            let slash = mem.indexOf(rest, '/')
+            client.host = if slash != null rest[0..slash.?] else rest
+        }
+
+        client.enabled = true
+        return client
+    }
+
+    // Query opening book - returns move list or empty on error
+    pub fn query_book(self: *BookClient, fen: []const u8, max_moves: u32) []BookMove {
+        if !self.enabled return &[_]BookMove{}
+
+        var body_buf: [512]u8 = undefined
+        let body = std.fmt.bufPrint(&body_buf,
+            "{{\"fen\":\"{s}\",\"max_moves\":{d}}}",
+            .{fen, max_moves}
+        ) catch return &[_]BookMove{}
+
+        let response = self.post("/book/query", body) catch return &[_]BookMove{}
+
+        return parse_book_response(response)
+    }
+
+    // Query TB8 tablebase - returns null WDL on error/disabled
+    pub fn query_tb8(self: *BookClient, fen: []const u8) Tb8Result {
+        if !self.enabled return Tb8Result{ .wdl = null, .dtz = null }
+
+        var body_buf: [512]u8 = undefined
+        let body = std.fmt.bufPrint(&body_buf,
+            "{{\"fen\":\"{s}\"}}",
+            .{fen}
+        ) catch return Tb8Result{ .wdl = null, .dtz = null }
+
+        let response = self.post("/tb8/query", body) catch {
+            return Tb8Result{ .wdl = null, .dtz = null }
+        }
+
+        return parse_tb8_response(response)
+    }
+
+    // Query NNUE training data
+    pub fn query_nnue(self: *BookClient, fen: []const u8) NnueResult {
+        if !self.enabled return NnueResult{ .score = null, .found = false }
+
+        var body_buf: [512]u8 = undefined
+        let body = std.fmt.bufPrint(&body_buf,
+            "{{\"fen\":\"{s}\"}}",
+            .{fen}
+        ) catch return NnueResult{ .score = null, .found = false }
+
+        let response = self.post("/nnue/query", body) catch {
+            return NnueResult{ .score = null, .found = false }
+        }
+
+        return parse_nnue_response(response)
+    }
+
+    // HTTP POST with timeout
+    fn post(self: *BookClient, path: []const u8, body: []const u8) ![]const u8 {
+        // Connect with timeout
+        let sock = try net.tcp_connect(self.host, self.port, self.timeout_ms)
+        defer net.close(sock)
+
+        // Set socket timeout
+        try net.set_timeout(sock, self.timeout_ms)
+
+        // Build request
+        var req_buf: [1024]u8 = undefined
+        let req = std.fmt.bufPrint(&req_buf,
+            "POST {s} HTTP/1.1\r\n" ++
+            "Host: {s}:{d}\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "{s}",
+            .{path, self.host, self.port, body.len, body}
+        ) catch return error.BufferOverflow
+
+        // Send
+        _ = try net.send(sock, req)
+
+        // Receive response
+        var resp_buf: [MAX_RESPONSE]u8 = undefined
+        let n = try net.recv(sock, &resp_buf, resp_buf.len)
+
+        // Find body start (after \r\n\r\n)
+        let body_start = mem.indexOf(resp_buf[0..n], "\r\n\r\n")
+        if body_start == null return error.InvalidResponse
+
+        return resp_buf[body_start.? + 4..n]
+    }
+}
+
+pub const BookMove = struct {
+    uci: [5]u8      // e.g. "e2e4" or "e7e8q"
+    uci_len: usize
+    weight: u16
+    learn: u32
+}
+
+pub const Tb8Result = struct {
+    wdl: ?i8        // -2=loss, -1=blessed loss, 0=draw, 1=cursed win, 2=win
+    dtz: ?i16
+}
+
+pub const NnueResult = struct {
+    score: ?i16
+    found: bool
+}
+
+// Parse book query JSON response
+fn parse_book_response(json: []const u8) []BookMove {
+    // Simple JSON parsing for: {"moves":[{"uci":"e2e4","weight":100},...]}
+    var moves: [64]BookMove = undefined
+    var count: usize = 0
+
+    var i: usize = 0
+    while i < json.len and count < 64 {
+        // Find "uci":"
+        let uci_start = mem.indexOf(json[i..], "\"uci\":\"")
+        if uci_start == null break
+
+        let uci_pos = i + uci_start.? + 7
+        let uci_end = mem.indexOf(json[uci_pos..], "\"")
+        if uci_end == null break
+
+        let uci = json[uci_pos..uci_pos + uci_end.?]
+        if uci.len > 5 {
+            i = uci_pos + uci_end.? + 1
+            continue
+        }
+
+        var mv = BookMove{
+            .uci = undefined,
+            .uci_len = uci.len,
+            .weight = 0,
+            .learn = 0,
+        }
+        mem.copy(&mv.uci, uci)
+
+        // Find weight
+        let weight_start = mem.indexOf(json[uci_pos..], "\"weight\":")
+        if weight_start != null {
+            let w_pos = uci_pos + weight_start.? + 9
+            mv.weight = parse_number(json[w_pos..]) catch 0
+        }
+
+        moves[count] = mv
+        count += 1
+        i = uci_pos + uci_end.? + 1
+    }
+
+    // Return slice (caller must copy if needed)
+    return moves[0..count]
+}
+
+// Parse TB8 query JSON response
+fn parse_tb8_response(json: []const u8) Tb8Result {
+    var result = Tb8Result{ .wdl = null, .dtz = null }
+
+    // Find "wdl":
+    let wdl_start = mem.indexOf(json, "\"wdl\":")
+    if wdl_start != null {
+        let w_pos = wdl_start.? + 6
+        if json[w_pos] != 'n' {  // not null
+            result.wdl = @intCast(i8, parse_signed(json[w_pos..]) catch return result)
+        }
+    }
+
+    // Find "dtz":
+    let dtz_start = mem.indexOf(json, "\"dtz\":")
+    if dtz_start != null {
+        let d_pos = dtz_start.? + 6
+        if json[d_pos] != 'n' {
+            result.dtz = @intCast(i16, parse_signed(json[d_pos..]) catch return result)
+        }
+    }
+
+    return result
+}
+
+// Parse NNUE query JSON response
+fn parse_nnue_response(json: []const u8) NnueResult {
+    var result = NnueResult{ .score = null, .found = false }
+
+    let score_start = mem.indexOf(json, "\"score\":")
+    if score_start != null {
+        let s_pos = score_start.? + 8
+        if json[s_pos] != 'n' {
+            result.score = @intCast(i16, parse_signed(json[s_pos..]) catch return result)
+            result.found = true
+        }
+    }
+
+    return result
+}
+
+fn parse_u16(s: []const u8) !u16 {
+    var result: u16 = 0
+    for s |c| {
+        if c < '0' or c > '9' break
+        result = result * 10 + (c - '0')
+    }
+    return result
+}
+
+fn parse_number(s: []const u8) !u16 {
+    var result: u16 = 0
+    for s |c| {
+        if c < '0' or c > '9' break
+        result = result * 10 + @intCast(u16, c - '0')
+    }
+    return result
+}
+
+fn parse_signed(s: []const u8) !i32 {
+    var neg = false
+    var i: usize = 0
+
+    if s.len > 0 and s[0] == '-' {
+        neg = true
+        i = 1
+    }
+
+    var result: i32 = 0
+    while i < s.len {
+        let c = s[i]
+        if c < '0' or c > '9' break
+        result = result * 10 + @intCast(i32, c - '0')
+        i += 1
+    }
+
+    return if neg -result else result
+}
+
+// Convenience: create global client from UCI option
+var global_client: ?BookClient = null
+
+pub fn init_from_option(url: []const u8) void {
+    global_client = BookClient.init(url)
+}
+
+pub fn get_client() ?*BookClient {
+    if global_client != null {
+        return &global_client.?
+    }
+    return null
+}

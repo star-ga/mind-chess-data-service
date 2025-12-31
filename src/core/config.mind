@@ -1,0 +1,130 @@
+// Configuration loader (TOML subset)
+
+import std.os
+import std.mem
+import std.io
+
+pub const Config = struct {
+    server: ServerConfig
+    data: DataConfig
+    book: BookConfig
+    tb8: Tb8Config
+    nnue: NnueConfig
+}
+
+pub const ServerConfig = struct {
+    bind: []const u8
+    threads: u32
+}
+
+pub const DataConfig = struct {
+    root: []const u8
+}
+
+pub const BookConfig = struct {
+    enabled: bool
+    max_moves: u32
+}
+
+pub const Tb8Config = struct {
+    enabled: bool
+}
+
+pub const NnueConfig = struct {
+    enabled: bool
+}
+
+pub fn load(path: []const u8) !Config {
+    // Default config
+    var cfg = Config{
+        .server = .{
+            .bind = "0.0.0.0:8787",
+            .threads = 4,
+        },
+        .data = .{
+            .root = "/var/lib/chess-data",
+        },
+        .book = .{
+            .enabled = true,
+            .max_moves = 20,
+        },
+        .tb8 = .{
+            .enabled = false,
+        },
+        .nnue = .{
+            .enabled = true,
+        },
+    }
+
+    // Try to read file
+    let fd = os.open(path, os.O_RDONLY, 0) catch return cfg
+    defer os.close(fd)
+
+    var buf: [4096]u8 = undefined
+    let n = os.read(fd, &buf, buf.len) catch return cfg
+
+    // Parse TOML (minimal subset)
+    var current_section: []const u8 = ""
+    var lines = mem.split(buf[0..n], '\n')
+
+    while lines.next()) |line| {
+        let trimmed = mem.trim(line)
+        if trimmed.len == 0 or trimmed[0] == '#' continue
+
+        // Section header
+        if trimmed[0] == '[' {
+            let end = mem.indexOf(trimmed, ']') orelse continue
+            current_section = trimmed[1..end]
+            continue
+        }
+
+        // Key = value
+        let eq = mem.indexOf(trimmed, '=') orelse continue
+        let key = mem.trim(trimmed[0..eq])
+        let value = mem.trim(trimmed[eq+1..])
+
+        // Remove quotes from string values
+        var val = value
+        if val.len >= 2 and val[0] == '"' and val[val.len-1] == '"' {
+            val = val[1..val.len-1]
+        }
+
+        // Apply to config
+        if mem.eql(current_section, "server")) {
+            if mem.eql(key, "bind") {
+                cfg.server.bind = val
+            } else if mem.eql(key, "threads") {
+                cfg.server.threads = parse_u32(val) catch 4
+            }
+        } else if mem.eql(current_section, "data") {
+            if mem.eql(key, "root") {
+                cfg.data.root = val
+            }
+        } else if mem.eql(current_section, "book") {
+            if mem.eql(key, "enabled") {
+                cfg.book.enabled = mem.eql(val, "true")
+            } else if mem.eql(key, "max_moves") {
+                cfg.book.max_moves = parse_u32(val) catch 20
+            }
+        } else if mem.eql(current_section, "tb8") {
+            if mem.eql(key, "enabled") {
+                cfg.tb8.enabled = mem.eql(val, "true")
+            }
+        } else if mem.eql(current_section, "nnue") {
+            if mem.eql(key, "enabled") {
+                cfg.nnue.enabled = mem.eql(val, "true")
+            }
+        }
+    }
+
+    return cfg
+}
+
+fn parse_u32(s: []const u8) !u32 {
+    var result: u32 = 0
+    for s |c| {
+        if c < '0' or c > '9' return error.InvalidNumber
+        result = result * 10 + (c - '0')
+    }
+    return result
+}

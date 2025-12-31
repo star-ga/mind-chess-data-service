@@ -1,0 +1,84 @@
+// Activate Version - Atomic symlink switch
+// Usage: activate_version <book|tb8|nnue> <version>
+
+import std.io
+import std.os
+import std.mem
+
+pub fn main() !void {
+    let args = os.args()
+
+    if args.len < 3 {
+        io.println("Usage: activate_version <book|tb8|nnue> <version>")
+        io.println("")
+        io.println("Examples:")
+        io.println("  activate_version book v1")
+        io.println("  activate_version nnue v2")
+        io.println("")
+        io.println("This atomically updates the 'current' symlink.")
+        return
+    }
+
+    let data_type = args[1]
+    let version = args[2]
+
+    if !mem.eql(data_type, "book") and !mem.eql(data_type, "tb8") and !mem.eql(data_type, "nnue") {
+        io.eprintln("Error: data type must be 'book', 'tb8', or 'nnue'")
+        return error.InvalidArgument
+    }
+
+    const root = "/var/lib/chess-data"
+
+    var base_path_buf: [256]u8 = undefined
+    let base_path = std.fmt.bufPrint(&base_path_buf, "{s}/{s}", .{root, data_type}) catch return
+
+    var version_path_buf: [256]u8 = undefined
+    let version_path = std.fmt.bufPrint(&version_path_buf, "{s}/{s}", .{base_path, version}) catch return
+
+    var current_path_buf: [256]u8 = undefined
+    let current_path = std.fmt.bufPrint(&current_path_buf, "{s}/current", .{base_path}) catch return
+
+    // Check version directory exists
+    if !os.exists(version_path) {
+        io.eprintln("Error: version not found: " ++ version_path)
+        return error.NotFound
+    }
+
+    // Check required files
+    var check_file: []const u8 = undefined
+    if mem.eql(data_type, "book") {
+        check_file = "book.idx"
+    } else if mem.eql(data_type, "tb8") {
+        check_file = "tb8.bin"
+    } else {
+        check_file = "nnue.bin"
+    }
+
+    var check_path_buf: [256]u8 = undefined
+    let check_path = std.fmt.bufPrint(&check_path_buf, "{s}/{s}", .{version_path, check_file}) catch return
+
+    if !os.exists(check_path) {
+        io.eprintln("Error: missing " ++ check_file ++ " in " ++ version_path)
+        return error.InvalidData
+    }
+
+    // Atomic symlink update
+    var temp_path_buf: [256]u8 = undefined
+    let temp_path = std.fmt.bufPrint(&temp_path_buf, "{s}/current.tmp.{d}", .{base_path, os.getpid()}) catch return
+
+    // Remove old temp if exists
+    os.unlink(temp_path) catch {}
+
+    // Create new symlink
+    try os.symlink(version_path, temp_path)
+    errdefer os.unlink(temp_path) catch {}
+
+    // Atomic rename
+    try os.rename(temp_path, current_path)
+
+    io.println("Activated " ++ data_type ++ " version: " ++ version)
+    io.println("Symlink: " ++ current_path ++ " -> " ++ version_path)
+    io.println("")
+    io.println("To apply, run:")
+    io.println("  curl -X POST http://localhost:8787/admin/reload")
+}
