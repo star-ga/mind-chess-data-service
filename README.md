@@ -358,6 +358,12 @@ activate_version book v2
 curl -X POST http://localhost:8787/admin/reload
 ```
 
+## Community
+
+- **Discussions:** <https://github.com/star-ga/mind/discussions> — questions,
+  ideas and help for mind-chess-data-service and the wider MIND ecosystem.
+- **Discord:** <https://mindlang.dev/discord> — the MindLang community server.
+
 ## License
 
 MIT
