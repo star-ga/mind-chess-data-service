@@ -24,10 +24,7 @@ check_mic() {
     if ! command -v mic &> /dev/null; then
         log_error "Mind compiler (mic) not found in PATH"
         echo ""
-        echo "Install Mind runtime:"
-        echo "  curl -sSL https://mindlang.dev/install.sh | sh"
-        echo ""
-        echo "Or add to PATH:"
+        echo "Add it to PATH:"
         echo "  export PATH=\$PATH:/path/to/mind/bin"
         exit 1
     fi
