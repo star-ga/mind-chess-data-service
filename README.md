@@ -22,7 +22,7 @@ sudo apt update
 sudo apt install -y git curl zstd build-essential
 
 # Install Mind runtime
-curl -fsSL https://mind-lang.org/install.sh | bash
+curl -sSL https://mindlang.dev/install.sh | sh
 export PATH="$PATH:$HOME/.mind/bin"
 
 # Clone and build
@@ -46,7 +46,7 @@ curl http://localhost:8787/health
 sudo dnf install -y git curl zstd gcc
 
 # Install Mind runtime
-curl -fsSL https://mind-lang.org/install.sh | bash
+curl -sSL https://mindlang.dev/install.sh | sh
 export PATH="$PATH:$HOME/.mind/bin"
 
 # Clone and build
@@ -74,7 +74,7 @@ curl http://localhost:8787/health
 sudo dnf install -y git curl zstd gcc
 
 # Install Mind runtime
-curl -fsSL https://mind-lang.org/install.sh | bash
+curl -sSL https://mindlang.dev/install.sh | sh
 export PATH="$PATH:$HOME/.mind/bin"
 
 # Clone and build
@@ -98,7 +98,7 @@ curl http://localhost:8787/health
 sudo pacman -Sy git curl zstd base-devel
 
 # Install Mind runtime
-curl -fsSL https://mind-lang.org/install.sh | bash
+curl -sSL https://mindlang.dev/install.sh | sh
 export PATH="$PATH:$HOME/.mind/bin"
 
 # Clone and build
@@ -122,7 +122,7 @@ curl http://localhost:8787/health
 sudo zypper install -y git curl zstd gcc
 
 # Install Mind runtime
-curl -fsSL https://mind-lang.org/install.sh | bash
+curl -sSL https://mindlang.dev/install.sh | sh
 export PATH="$PATH:$HOME/.mind/bin"
 
 # Clone and build
